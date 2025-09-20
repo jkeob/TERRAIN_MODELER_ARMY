@@ -1,0 +1,15 @@
+{
+  "pipeline": [
+    "C:/Users/jpo2k/TERRAIN MODELER/ground.laz",
+    { "type":"filters.range", "limits":"Classification[2:2]" },
+    {
+      "type":"writers.gdal",
+      "filename":"C:/Users/jpo2k/TERRAIN MODELER/dem_1m.tif",
+      "gdaldriver":"GTiff",
+      "resolution": 1.0,
+      "output_type":"idw",
+      "radius": 1.5,
+      "nodata": -9999
+    }
+  ]
+}

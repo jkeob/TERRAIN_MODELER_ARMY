@@ -1,0 +1,14 @@
+﻿# Python
+__pycache__/
+*.pyc
+
+# Editors
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# OS junk
+Thumbs.db
+.DS_Store

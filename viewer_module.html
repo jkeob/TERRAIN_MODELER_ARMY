@@ -1,0 +1,336 @@
+﻿<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Terrain Viewer (GLB)</title>
+  <style>
+    html,body{height:100%;margin:0;background:#111}
+    canvas{display:block}
+    #ui{position:fixed;top:12px;left:12px;background:#000a;color:#fff;padding:10px 12px;border-radius:10px;font:14px system-ui}
+    #status{position:fixed;right:12px;top:12px;background:#000a;color:#fff;padding:6px 8px;border-radius:8px;font:12px system-ui}
+    #ui label{margin-right:10px}
+    button{cursor:pointer}
+    /* crosshair */
+    #crosshair{
+      position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
+      width:18px;height:18px;pointer-events:none;opacity:.7;
+    }
+    #crosshair:before,#crosshair:after{
+      content:"";position:absolute;left:50%;top:50%;background:#fff;
+    }
+    #crosshair:before{width:18px;height:2px;transform:translate(-50%,-50%);} /* horiz */
+    #crosshair:after{width:2px;height:18px;transform:translate(-50%,-50%);}   /* vert  */
+  </style>
+</head>
+<body>
+<div id="ui">
+  <div style="margin-bottom:8px">
+    <b>Vertical exaggeration:</b>
+    <input id="ex" type="range" min="0.5" max="3" step="0.1" value="2">
+    <span id="exv">2.0</span>
+  </div>
+  <div style="margin-bottom:8px">
+    <button id="place">Place squad</button>
+    <button id="clear">Clear</button>
+    <button id="reset">Reset view</button>
+  </div>
+  <div style="margin-bottom:8px">
+    <label><input type="checkbox" id="showGrid"> Grid</label>
+    <label><input type="checkbox" id="showBBox"> Bounds</label>
+  </div>
+  <div style="margin-bottom:4px">
+    Sun azimuth: <input id="sun" type="range" min="0" max="360" value="315">
+    <span id="sunv">315°</span>
+  </div>
+</div>
+<div id="status">loading…</div>
+<div id="crosshair" aria-hidden="true"></div>
+
+<!-- milsymbol classic script -->
+<script src="./milsymbol.development.js"></script>
+
+<!-- import map for modules -->
+<script type="importmap">
+{ "imports": { "three": "./three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from './OrbitControls.js';
+import { GLTFLoader } from './GLTFLoader.js';
+
+const statusEl = document.getElementById('status');
+
+// renderer
+const renderer = new THREE.WebGLRenderer({ antialias:false, powerPreference:'high-performance', precision:'mediump' });
+renderer.setPixelRatio(1);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// camera + controls
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1e8);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.enablePan = true;
+controls.screenSpacePanning = true;
+controls.minDistance = 1;
+controls.maxDistance = 1e7;
+controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+controls.touches      = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+controls.listenToKeyEvents(window); // built-in key handling
+
+// scene + lights
+const scene = new THREE.Scene();
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
+const sun = new THREE.DirectionalLight(0xffffff, 0.9); sun.position.set(1,1,1); scene.add(sun);
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+let terrain, bboxHelper=null, gridHelper=null;
+const terrainGroup = new THREE.Group(); scene.add(terrainGroup);
+
+// ---------- CONFIG: which GLB to load ----------
+const RAW_NAME = 'dem_1m_clip.glb';
+const GLB_NAME = `./${RAW_NAME}?v=${Date.now()}`;
+console.log('Loading:', GLB_NAME);
+
+// ---------- Shaded-relief colorizer ----------
+let SUN_AZ = 315; // degrees
+
+function colorizeMesh(mesh) {
+  // Traverse all meshes and set vertex colors based on elevation/slope/hillshade/water heuristic.
+  mesh.traverse(n=>{
+    if (!n.isMesh || !n.geometry || !n.geometry.attributes.position) return;
+
+    // Ensure normals exist
+    n.geometry.computeVertexNormals?.();
+
+    const pos = n.geometry.attributes.position;
+    const normalAttr = n.geometry.attributes.normal || null;
+    const vertexCount = pos.count;
+
+    // Elevation span in mesh (pre-exaggeration) space
+    let zMin = +Infinity, zMax = -Infinity;
+    for (let i=0; i<vertexCount; i++){
+      const z = pos.getZ(i);
+      if (z < zMin) zMin = z;
+      if (z > zMax) zMax = z;
+    }
+    const span = Math.max(1e-6, zMax - zMin);
+
+    const colors = new Float32Array(vertexCount * 3);
+    const c = new THREE.Color();
+
+    const az = THREE.MathUtils.degToRad(SUN_AZ);
+    const light = new THREE.Vector3(Math.cos(az), 1.0, Math.sin(az)).normalize(); // oblique sun
+
+    for (let i=0; i<vertexCount; i++){
+      const z = pos.getZ(i);
+      const elev01 = (z - zMin) / span; // 0..1 elevation
+
+      const nrm = normalAttr ? new THREE.Vector3(
+        normalAttr.getX(i), normalAttr.getY(i), normalAttr.getZ(i)
+      ).normalize() : new THREE.Vector3(0,1,0);
+
+      // slope: 0 flat, 1 vertical (Y-up after our rotation)
+      const slope = 1.0 - Math.abs(nrm.y);
+
+      // --- base hypsometric ramp ---
+      if (elev01 < 0.25)      c.setRGB(0.25,0.45,0.20); // deep green
+      else if (elev01 < 0.50) c.setRGB(0.35,0.55,0.25);
+      else if (elev01 < 0.70) c.setRGB(0.55,0.60,0.30); // foothills
+      else if (elev01 < 0.85) c.setRGB(0.60,0.50,0.35); // rock/tan
+      else                    c.setRGB(0.95,0.95,0.95); // high/snow
+
+      // Steep slopes → rockier tint
+      c.lerp(new THREE.Color(0.65,0.52,0.38), slope * 0.6);
+
+      // Quick water heuristic: flat & low → blue tint
+      if (slope < 0.06 && elev01 < 0.15) {
+        c.lerp(new THREE.Color(0.35,0.55,0.85), 0.65);
+      }
+
+      // Hillshade (from normal vs sun dir) with floor to avoid pure black
+      const shade = Math.max(0.25, nrm.dot(light));
+      c.multiplyScalar(0.85 + 0.45 * shade);
+
+      colors[i*3+0] = c.r;
+      colors[i*3+1] = c.g;
+      colors[i*3+2] = c.b;
+    }
+
+    n.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    n.material = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      roughness: 0.9,
+      metalness: 0.0,
+      side: THREE.DoubleSide
+    });
+    n.material.needsUpdate = true;
+  });
+}
+
+// ---------- Load GLB ----------
+new GLTFLoader().load(
+  GLB_NAME,
+  (gltf)=>{
+    const obj = gltf.scene || gltf.scenes?.[0];
+    // Z-up -> Y-up
+    obj.rotation.x = -Math.PI/2;
+
+    // center & fit
+    const box = new THREE.Box3().setFromObject(obj);
+    const center = box.getCenter(new THREE.Vector3());
+    const sphere = box.getBoundingSphere(new THREE.Sphere());
+    obj.position.sub(center);
+
+    terrain = obj;
+    terrainGroup.add(obj);
+
+    // default vertical exaggeration
+    const ex = document.getElementById('ex');
+    const exv = document.getElementById('exv');
+    const startEx = parseFloat(ex.value);
+    terrain.scale.set(1, startEx, 1);
+    exv.textContent = startEx.toFixed(1);
+
+    // colorize once loaded
+    colorizeMesh(terrain);
+
+    // camera fit
+    const radius = Math.max(1, sphere.radius || 100);
+    const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov)/2);
+    camera.position.set(0, dist, dist);
+    controls.target.set(0, 0, 0);
+    controls.update();
+
+    statusEl.textContent = `ready (radius ~ ${radius.toFixed(1)})`;
+
+    // helpers (off by default; toggled by checkboxes)
+    gridHelper = new THREE.GridHelper(
+      Math.max(500, (box.max.x - box.min.x), (box.max.z - box.min.z)),
+      20, 0x444444, 0x222222
+    );
+    gridHelper.visible = false;
+    scene.add(gridHelper);
+
+    bboxHelper = new THREE.Box3Helper(box, 0xffaa00);
+    bboxHelper.visible = false;
+    scene.add(bboxHelper);
+  },
+  (xhr)=>{
+    if (xhr.total) statusEl.textContent = `loading… ${Math.round(xhr.loaded/xhr.total*100)}%`;
+    else statusEl.textContent = `loading… ${Math.round(xhr.loaded/1024/1024)} MB`;
+  },
+  (err)=>{ console.error(err); statusEl.textContent = 'load error'; }
+);
+
+// ---------- UI ----------
+const ex = document.getElementById('ex'), exv = document.getElementById('exv');
+ex.addEventListener('input', ()=>{
+  exv.textContent = ex.value;
+  if (terrain){
+    terrain.scale.set(1, parseFloat(ex.value), 1);
+    // Recolor not strictly necessary for exag, but normals visual may change subtly:
+    colorizeMesh(terrain);
+  }
+});
+
+document.getElementById('reset').onclick = ()=>{
+  if (!terrain) return;
+  const box = new THREE.Box3().setFromObject(terrain);
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  const radius = Math.max(1, sphere.radius || 100);
+  const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov)/2);
+  camera.position.set(0, dist, dist);
+  controls.target.set(0, 0, 0);
+  controls.update();
+};
+
+document.getElementById('showGrid').addEventListener('change', e=>{
+  if (gridHelper) gridHelper.visible = e.target.checked;
+});
+document.getElementById('showBBox').addEventListener('change', e=>{
+  if (bboxHelper) bboxHelper.visible = e.target.checked;
+});
+
+// Sun slider → re-color live
+const sunSlider = document.getElementById('sun');
+const sunv = document.getElementById('sunv');
+sunSlider.addEventListener('input', (e)=>{
+  SUN_AZ = parseFloat(e.target.value);
+  sunv.textContent = `${SUN_AZ}°`;
+  if (terrain) colorizeMesh(terrain);
+});
+
+// MIL-STD-2525 placement
+let placing = false;
+document.getElementById('place').onclick = ()=>{ placing = true; statusEl.textContent = 'click terrain to place'; };
+document.getElementById('clear').onclick = ()=>{
+  terrainGroup.children.slice().forEach(o=>{ if (o.userData && o.userData.milsymbol) terrainGroup.remove(o); });
+};
+const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+addEventListener('pointerdown', (e)=>{
+  if (!placing || !terrain) return;
+  const r = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - r.left)/r.width)*2 - 1;
+  mouse.y = -((e.clientY - r.top)/r.height)*2 + 1;
+  ray.setFromCamera(mouse, camera);
+  const hits = ray.intersectObject(terrain, true);
+  if (hits.length){
+    const p = hits[0].point;
+    const sym = new ms.Symbol('SFGPUCI----K', { size: 64 });
+    const tex = new THREE.CanvasTexture(sym.asCanvas());
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
+    sprite.scale.set(80,80,1);
+    sprite.position.copy(p).add(new THREE.Vector3(0,10,0));
+    sprite.userData.milsymbol = true;
+    terrainGroup.add(sprite);
+    placing = false; statusEl.textContent = 'symbol placed';
+  } else { statusEl.textContent = 'no hit'; }
+});
+
+// ---------- Movement (W/S forward-back on ground; A/D strafe; wheel = default dolly) ----------
+function sceneStep(mult=1.0){
+  if (!terrain) return 50 * mult;
+  const box = new THREE.Box3().setFromObject(terrain);
+  const diag = box.getSize(new THREE.Vector3()).length() || 1000;
+  return diag * 0.01 * mult; // 1% of diagonal
+}
+
+addEventListener('keydown', (e)=>{
+  if (!terrain) return;
+  const k = e.key.toLowerCase();
+  const step = sceneStep(1.0);
+
+  // forward: camera -> target projected to XZ plane
+  const forward = controls.target.clone().sub(camera.position).setY(0);
+  if (forward.lengthSq() === 0) forward.set(0,0,-1);
+  forward.normalize();
+
+  // right on ground: UP × forward
+  const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), forward).normalize();
+
+  const move = (v)=>{
+    camera.position.add(v);
+    controls.target.add(v);
+    controls.update();
+  };
+
+  if (k === 'w') move(forward.clone().multiplyScalar( step));
+  if (k === 's') move(forward.clone().multiplyScalar(-step));
+  if (k === 'd') move(right.clone().multiplyScalar(-step));
+  if (k === 'a') move(right.clone().multiplyScalar( step));
+  if (k === 'q') { controls.dollyIn(1.1);  controls.update(); }
+  if (k === 'e') { controls.dollyOut(1.1); controls.update(); }
+});
+
+// resize + animate
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+(function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+</script>
+</body>
+</html>

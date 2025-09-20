@@ -1,0 +1,149 @@
+﻿<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Terrain Viewer (modules)</title>
+  <style>
+    html,body{height:100%;margin:0;background:#111} canvas{display:block}
+    #ui{position:fixed;top:12px;left:12px;background:#000a;color:#fff;padding:10px 12px;border-radius:10px;font:14px system-ui}
+    #status{position:fixed;right:12px;top:12px;background:#000a;color:#fff;padding:6px 8px;border-radius:8px;font:12px system-ui}
+    button{cursor:pointer}
+  </style>
+</head>
+<body>
+<div id="ui">
+  <b>Vertical exaggeration:</b>
+  <input id="ex" type="range" min="0.5" max="3" step="0.1" value="1">
+  <span id="exv">1.0</span>
+  <div style="margin-top:8px">
+    <button id="place">Place squad</button>
+    <button id="clear">Clear</button>
+  </div>
+</div>
+<div id="status">loading…</div>
+
+<!-- local milsymbol (classic script) -->
+<script src="./milsymbol.development.js"></script>
+
+<!-- import map for module specifier "three" -->
+<script type="importmap">
+{
+  "imports": { "three": "./three.module.js" }
+}
+</script>
+
+<!-- MAIN APP -->
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from './OrbitControls.js';
+import { OBJLoader } from './OBJLoader.js';
+
+const statusEl = document.getElementById('status');
+
+// renderer / camera / controls
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1e8);
+const controls = new OrbitControls(camera, renderer.domElement);
+
+// scene + lights + helpers
+const scene = new THREE.Scene();
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
+const d = new THREE.DirectionalLight(0xffffff, 0.8); d.position.set(1,1,1); scene.add(d);
+scene.add(new THREE.GridHelper(1000, 20, 0x444444, 0x222222)); // reference grid
+
+// terrain group
+let terrain;
+const terrainGroup = new THREE.Group();
+scene.add(terrainGroup);
+
+// ---- choose which OBJ to load ----
+// use 'dem_1m.obj' if you kept it small (GRID_STEP 8+), or 'dem_4m.obj' if you made it:
+const OBJ_NAME = 'dem_1m.obj'; // change to 'dem_4m.obj' if that's what you made
+// ----------------------------------
+
+const loader = new OBJLoader();
+loader.load(OBJ_NAME, (obj)=>{
+  terrain = obj;
+  // OBJ is Z-up; rotate so Y is up for Three
+  terrain.rotation.x = -Math.PI/2;
+
+  // center the mesh and auto-fit the camera to the bounding sphere
+  const box = new THREE.Box3().setFromObject(terrain);
+  const center = box.getCenter(new THREE.Vector3());
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  terrain.position.sub(center);
+  terrainGroup.add(terrain);
+
+  const radius = sphere.radius || 100;
+  const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov) / 2);
+  camera.position.set(0, dist, dist);   // back & up a bit
+  controls.target.set(0, 0, 0);
+  controls.update();
+
+  statusEl.textContent = 'ready (orbit: drag, zoom: wheel)';
+  console.log('Loaded OBJ:', OBJ_NAME, 'radius:', radius.toFixed(2));
+}, (xhr)=>{
+  if (xhr.total) {
+    statusEl.textContent = `loading… ${Math.round(xhr.loaded/xhr.total*100)}%`;
+  } else {
+    statusEl.textContent = `loading… ${Math.round(xhr.loaded/1024/1024)} MB`;
+  }
+}, (err)=>{
+  console.error('OBJ load error:', err);
+  statusEl.textContent = 'load error (see console)';
+});
+
+// UI
+const ex = document.getElementById('ex'), exv = document.getElementById('exv');
+ex.addEventListener('input', ()=>{
+  exv.textContent = ex.value;
+  if (terrain) terrain.scale.set(1, ex.value, 1); // vertical exaggeration (Y after rotation)
+});
+
+document.getElementById('place').onclick = ()=>{
+  placing = true; statusEl.textContent = 'click terrain to place';
+};
+document.getElementById('clear').onclick = ()=>{
+  terrainGroup.children.slice().forEach(o=>{
+    if (o.userData && o.userData.milsymbol) terrainGroup.remove(o);
+  });
+};
+
+// click-to-place MIL-STD-2525 symbol
+let placing = false;
+const raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2();
+addEventListener('pointerdown', (e)=>{
+  if (!placing || !terrain) return;
+  const r = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - r.left)/r.width)*2 - 1;
+  mouse.y = -((e.clientY - r.top)/r.height)*2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObject(terrain, true);
+  if (hits.length){
+    const p = hits[0].point;
+    const sym = new ms.Symbol('SFGPUCI----K', { size: 64 }); // friendly infantry squad
+    const tex = new THREE.CanvasTexture(sym.asCanvas());
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
+    sprite.scale.set(80,80,1);
+    sprite.position.copy(p).add(new THREE.Vector3(0,10,0));
+    sprite.userData.milsymbol = true;
+    terrainGroup.add(sprite);
+    placing = false; statusEl.textContent = 'symbol placed';
+  } else {
+    statusEl.textContent = 'no hit';
+  }
+});
+
+// resize + render loop
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+(function animate(){ requestAnimationFrame(animate); renderer.render(scene, camera); })();
+</script>
+</body>
+</html>
